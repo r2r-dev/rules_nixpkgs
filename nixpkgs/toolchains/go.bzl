@@ -67,6 +67,7 @@ def nixpkgs_go_configure(
               ctx.file("imports.bzl", imports_for_non_nix)
 
       _gen_imports = repository_rule(
+          remotable = True,
           implementation = _gen_imports_impl,
           attrs = dict(),
       )
@@ -110,7 +111,11 @@ def nixpkgs_go_configure(
 
     if not nix_file and not nix_file_content:
         nix_file_content = """
-            with import <nixpkgs> { config = {}; overlays = []; }; buildEnv {
+            with import (builtins.fetchTarball {
+                name = "nixos-unstable-2018-09-12";
+                url = "https://github.com/nixos/nixpkgs/archive/ad4db3f4d8ae54482c63c31c14921cb73953548d.tar.gz";
+                sha256 = "1fwl898f6wznkjpwq11brgadz6iff5w5f4lwj2l7ax2rz7r03mnn";
+            }) { config = {}; overlays = []; }; buildEnv {
               name = "bazel-go-toolchain";
               paths = [
                 go

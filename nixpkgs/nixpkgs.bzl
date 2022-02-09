@@ -29,6 +29,7 @@ def _nixpkgs_git_repository_impl(repository_ctx):
     )
 
 nixpkgs_git_repository = repository_rule(
+    remotable = True,
     implementation = _nixpkgs_git_repository_impl,
     attrs = {
         "revision": attr.string(
@@ -81,6 +82,7 @@ def _nixpkgs_local_repository_impl(repository_ctx):
 
 nixpkgs_local_repository = repository_rule(
     implementation = _nixpkgs_local_repository_impl,
+    remotable = True,
     attrs = {
         "nix_file": attr.label(
             allow_single_file = [".nix"],
@@ -140,7 +142,7 @@ def _nixpkgs_package_impl(repository_ctx):
         fail("Specify one of 'nix_file' or 'nix_file_content', but not both.")
     elif repository_ctx.attr.nix_file:
         nix_file = _cp(repository_ctx, repository_ctx.attr.nix_file)
-        expr_args = [repository_ctx.path(nix_file)]
+        expr_args = [str(repository_ctx.path(nix_file))]
     elif repository_ctx.attr.nix_file_content:
         expr_args = ["-E", repository_ctx.attr.nix_file_content]
     elif not repositories:
@@ -201,22 +203,37 @@ def _nixpkgs_package_impl(repository_ctx):
     elif not_supported:
         return
     else:
+
+        sha = ""
+        if repository_ctx.attr.nix_file:
+            sha256 = str(repository_ctx.which("sha256sum"))
+            sha_result = _execute_or_fail(
+                repository_ctx,
+                [sha256, repository_ctx.attr.nix_file],
+                failure_message = "ehh",
+                quiet = repository_ctx.attr.quiet,
+                timeout = 7200,
+            )
+            sha = sha_result.stdout.splitlines()[-1]
+
         nix_build_path = _executable_path(
             repository_ctx,
             "nix-build",
             extra_msg = "See: https://nixos.org/nix/",
         )
-        nix_build = [nix_build_path] + expr_args
-
+        nix_build = [str(nix_build_path)] + expr_args
+        
         # Large enough integer that Bazel can still parse. We don't have
         # access to MAX_INT and 0 is not a valid timeout so this is as good
         # as we can do. The value shouldn't be too large to avoid errors on
         # macOS, see https://github.com/tweag/rules_nixpkgs/issues/92.
-        timeout = 8640000
+        timeout = 7200
         repository_ctx.report_progress("Building Nix derivation")
+        print("Building Nix derivation")
         exec_result = _execute_or_fail(
             repository_ctx,
             nix_build,
+            environment = {"SHA": sha},
             failure_message = "Cannot build Nix attribute '{}'.".format(
                 repository_ctx.attr.attribute_path,
             ),
@@ -229,10 +246,19 @@ def _nixpkgs_package_impl(repository_ctx):
         test_path = repository_ctx.which("test")
         _execute_or_fail(
             repository_ctx,
-            [test_path, "-d", output_path],
+            [str(test_path), "-d", str(output_path)],
             failure_message = "nixpkgs_package '@{}' outputs a single file which is not supported by rules_nixpkgs. Please only use directories.".format(
                 repository_ctx.name,
             ),
+        )
+
+        print("Copying closure to client")
+        nix_copy_closure_path = repository_ctx.which("nix-copy-closure")
+        _execute_or_fail(
+            repository_ctx,
+            [str(nix_copy_closure_path), "--to", "{}@{}".format(repository_ctx.os.environ["CLIENT_NAME"], repository_ctx.os.environ["CLIENT_HOST"]), str(output_path)],
+            failure_message = "copy closure failed",
+            environment = {"SHA": sha},
         )
 
         # Build a forest of symlinks (like new_local_package() does) to the
@@ -250,6 +276,8 @@ def _nixpkgs_package_impl(repository_ctx):
 
 _nixpkgs_package = repository_rule(
     implementation = _nixpkgs_package_impl,
+    remotable = True,
+    environ = ["TIMESTAMP"],
     attrs = {
         "attribute_path": attr.string(),
         "nix_file": attr.label(allow_single_file = [".nix"]),
@@ -266,6 +294,17 @@ _nixpkgs_package = repository_rule(
                                         """),
     },
 )
+
+def _symlink_dir(repository_ctx, src_dir, dest_dir):
+    """Symlinks all the files in a directory.
+    Args:
+      repository_ctx: The repository context.
+      src_dir: The source directory.
+      dest_dir: The destination directory to create the symlinks in.
+    """
+    files = repository_ctx.path(src_dir).readdir()
+    for src_file in files:
+        repository_ctx.symlink(src_file, dest_dir + "/" + src_file.basename)
 
 def nixpkgs_package(
         name,
@@ -540,6 +579,7 @@ def _nixpkgs_cc_toolchain_config_impl(repository_ctx):
 
 _nixpkgs_cc_toolchain_config = repository_rule(
     _nixpkgs_cc_toolchain_config_impl,
+    remotable = True,
     attrs = {
         "cc_toolchain_info": attr.label(),
         "fail_not_supported": attr.bool(),
@@ -613,6 +653,7 @@ toolchain(
 
 _nixpkgs_cc_toolchain = repository_rule(
     _nixpkgs_cc_toolchain_impl,
+    remotable = True,
     attrs = {
         "cc_toolchain_config": attr.string(),
         "exec_constraints": attr.string_list(),
@@ -624,6 +665,7 @@ def nixpkgs_cc_configure(
         name = "local_config_cc",
         attribute_path = "",
         nix_file = None,
+        nix_toolchain_info_file = "@io_tweag_rules_nixpkgs//nixpkgs:toolchains/cc.nix",
         nix_file_content = "",
         nix_file_deps = [],
         repositories = {},
@@ -710,7 +752,7 @@ def nixpkgs_cc_configure(
     # Invoke `toolchains/cc.nix` which generates `CC_TOOLCHAIN_INFO`.
     nixpkgs_package(
         name = "{}_info".format(name),
-        nix_file = "@io_tweag_rules_nixpkgs//nixpkgs:toolchains/cc.nix",
+        nix_file = nix_toolchain_info_file,
         nix_file_deps = nix_file_deps,
         build_file_content = "exports_files(['CC_TOOLCHAIN_INFO'])",
         repositories = repositories,
@@ -919,6 +961,7 @@ toolchain(
 
 _nixpkgs_python_toolchain = repository_rule(
     _nixpkgs_python_toolchain_impl,
+    remotable = True,
     attrs = {
         # Using attr.string instead of attr.label, so that the repository rule
         # does not explicitly depend on the nixpkgs_package instances. This is
@@ -954,9 +997,11 @@ runCommand "bazel-nixpkgs-python-toolchain"
 def nixpkgs_python_configure(
         name = "nixpkgs_python_toolchain",
         python2_attribute_path = None,
+        python2_nix_file = None,
         python2_bin_path = "bin/python",
         python3_attribute_path = "python3",
         python3_bin_path = "bin/python",
+        python3_nix_file = None,
         repository = None,
         repositories = {},
         nix_file_deps = None,
@@ -986,8 +1031,8 @@ def nixpkgs_python_configure(
       fail_not_supported: See [`nixpkgs_package`](#nixpkgs_package-fail_not_supported).
       quiet: See [`nixpkgs_package`](#nixpkgs_package-quiet).
     """
-    python2_specified = python2_attribute_path and python2_bin_path
-    python3_specified = python3_attribute_path and python3_bin_path
+    python2_specified = (python2_attribute_path and python2_bin_path) or python2_nix_file
+    python3_specified = (python3_attribute_path and python3_bin_path) or python3_nix_file
     if not python2_specified and not python3_specified:
         fail("At least one of python2 or python3 has to be specified.")
     kwargs = dict(
@@ -1010,6 +1055,15 @@ def nixpkgs_python_configure(
             ),
             **kwargs
         )
+
+    if python2_nix_file:
+        python2_runtime = "@%s_python2//:runtime" % name
+        nixpkgs_package(
+            name = name + "_python2",
+            nix_file = python2_nix_file,
+            **kwargs
+        )
+
     python3_runtime = None
     if python3_attribute_path:
         python3_runtime = "@%s_python3//:runtime" % name
@@ -1022,6 +1076,15 @@ def nixpkgs_python_configure(
             ),
             **kwargs
         )
+
+    if python3_nix_file:
+        python3_runtime = "@%s_python3//:runtime" % name
+        nixpkgs_package(
+            name = name + "_python3",
+            nix_file = python3_nix_file,
+            **kwargs
+        )
+
     _nixpkgs_python_toolchain(
         name = name,
         python2_runtime = python2_runtime,
@@ -1202,7 +1265,7 @@ Error output:
 
 def _find_children(repository_ctx, target_dir):
     find_args = [
-        _executable_path(repository_ctx, "find"),
+        str(_executable_path(repository_ctx, "find")),
         "-L",
         target_dir,
         "-maxdepth",
